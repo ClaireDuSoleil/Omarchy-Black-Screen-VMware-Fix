@@ -1,0 +1,453 @@
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+index 9c7a73c..9d87f19 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_bo.c
+@@ -651,6 +651,19 @@ int vmw_user_bo_lookup(struct drm_file *filp,
+ 		return -ESRCH;
+ 	}
+ 
++	/*
++	 * A handle in the standard GEM table is not necessarily a real
++	 * vmw_bo -- it may be a prime-import bridge object (see
++	 * vmwgfx_prime.c). to_vmw_bo() below is an unchecked container_of;
++	 * calling it on anything else corrupts an out-of-bounds pointer.
++	 */
++	if (gobj->funcs != &vmw_gem_object_funcs) {
++		drm_gem_object_put(gobj);
++		DRM_ERROR("Handle 0x%08lx is not a vmwgfx buffer object.\n",
++			  (unsigned long)handle);
++		return -ESRCH;
++	}
++
+ 	*out = to_vmw_bo(gobj);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+index 38bea8a..0d4060a 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@ -788,6 +788,7 @@ extern int vmw_resource_reserve(struct vmw_resource *res, bool interruptible,
+ extern bool vmw_resource_needs_backup(const struct vmw_resource *res);
+ extern int vmw_user_resource_lookup_handle(
+ 	struct vmw_private *dev_priv,
++	struct drm_file *file_priv,
+ 	struct ttm_object_file *tfile,
+ 	uint32_t handle,
+ 	const struct vmw_user_resource_conv *converter,
+@@ -1105,6 +1106,9 @@ extern int vmw_prime_handle_to_fd(struct drm_device *dev,
+ 				  struct drm_file *file_priv,
+ 				  uint32_t handle, uint32_t flags,
+ 				  int *prime_fd);
++extern struct drm_gem_object *
++vmw_prime_resolve_handle(struct drm_file *file_priv, uint32_t handle,
++			 uint32_t *real_handle);
+ struct drm_gem_object *vmw_prime_import_sg_table(struct drm_device *dev,
+ 						 struct dma_buf_attachment *attach,
+ 						 struct sg_table *table);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c b/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+index a9136a6..7383319 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+@@ -648,7 +648,8 @@ vmw_cmd_res_check(struct vmw_private *dev_priv,
+ 			return ret;
+ 
+ 		ret = vmw_user_resource_lookup_handle
+-			(dev_priv, sw_context->fp->tfile, *id_loc, converter, &res);
++			(dev_priv, sw_context->filp, sw_context->fp->tfile, *id_loc,
++			 converter, &res);
+ 		if (ret != 0) {
+ 			VMW_DEBUG_USER("Could not find/use resource 0x%08x.\n",
+ 				       (unsigned int) *id_loc);
+@@ -4073,7 +4074,7 @@ static int vmw_execbuf_tie_context(struct vmw_private *dev_priv,
+ 		return ret;
+ 
+ 	ret = vmw_user_resource_lookup_handle
+-		(dev_priv, sw_context->fp->tfile, handle,
++		(dev_priv, sw_context->filp, sw_context->fp->tfile, handle,
+ 		 user_context_converter, &res);
+ 	if (ret != 0) {
+ 		VMW_DEBUG_USER("Could not find or user DX context 0x%08x.\n",
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c b/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c
+index d962ef2..1494a8d 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c
+@@ -220,7 +220,7 @@ int vmw_present_ioctl(struct drm_device *dev, void *data,
+ 	}
+ 	vfb = vmw_framebuffer_to_vfb(fb);
+ 
+-	ret = vmw_user_resource_lookup_handle(dev_priv, tfile, arg->sid,
++	ret = vmw_user_resource_lookup_handle(dev_priv, file_priv, tfile, arg->sid,
+ 					      user_surface_converter,
+ 					      &res);
+ 	if (ret)
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_prime.c b/drivers/gpu/drm/vmwgfx/vmwgfx_prime.c
+index 598b90a..72582af 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_prime.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_prime.c
+@@ -35,6 +35,7 @@
+ #include "vmwgfx_bo.h"
+ #include "ttm_object.h"
+ #include <linux/dma-buf.h>
++#include <linux/slab.h>
+ 
+ /*
+  * DMA-BUF attach- and mapping methods. No need to implement
+@@ -72,15 +73,186 @@ const struct dma_buf_ops vmw_prime_dmabuf_ops =  {
+ 	.release = NULL,
+ };
+ 
++/*
++ * A surface-backed dma-buf can only be imported through
++ * ttm_prime_fd_to_handle() -- vmw_prime_dmabuf_ops leaves .attach and
++ * .map_dma_buf unimplemented above, so the generic PRIME import path
++ * (drm_gem_prime_fd_to_handle() -> dma_buf_attach()) can never reach it and
++ * fails with -ENOSYS before it starts. ttm_prime_fd_to_handle() works
++ * because it bypasses dma-buf attach/map entirely and reads dma_buf->priv
++ * directly, but the handle it returns lives in the private ttm_object
++ * table (tdev->idr), not file_priv->object_idr, so the generic
++ * DRM_IOCTL_GEM_CLOSE (drm_gem_handle_delete(), which only ever looks in
++ * file_priv->object_idr) can never find it and fails with -EINVAL.
++ *
++ * Bridge the two tables: wrap the real ttm_base_object in a minimal,
++ * non-TTM-backed GEM object and hand back a handle from the standard
++ * table instead, so ordinary GEM_CLOSE succeeds.
++ *
++ * Existing userspace (Mesa's own SVGA winsys, in vmw_drm_surface_from_handle())
++ * calls this exact ioctl for real rendering imports too, then feeds the
++ * returned value straight back into DRM_VMW_REF_SURFACE / DRM_VMW_UNREF_SURFACE
++ * as a raw ttm handle -- it is not just a probe-only code path. So the value
++ * returned here must keep working as a raw ttm handle for those two ioctls
++ * and for every execbuf command that references a surface by handle
++ * (vmw_user_resource_lookup_handle(), the single choke point all of those
++ * funnel through). vmw_prime_resolve_handle() below is called from all three
++ * of those places to transparently redirect a bridge handle back to the real
++ * ttm handle, so existing userspace keeps working unmodified.
++ *
++ * The bridge's own hold on the object is a *separate*, independent
++ * ttm_base_object reference (taken via ttm_base_object_lookup_for_ref(),
++ * released via ttm_base_object_unref()), not a claim on the tfile-scoped
++ * ttm_ref_object entry that REF_SURFACE/UNREF_SURFACE manipulate. That
++ * entry is created transiently by ttm_prime_fd_to_handle() below and is
++ * deliberately left alone on success -- see the comment at the end of
++ * vmw_prime_fd_to_handle() for why it cannot simply be dropped here
++ * (vmw_surface_handle_reference()'s require_exist path depends on it
++ * still existing). This bridge's own reference exists alongside it,
++ * purely so this bridge's lifetime never depends on how many times
++ * userspace itself opens and closes references to the same ttm handle:
++ * without it, if userspace fully released the ttm handle through its own
++ * REF/UNREF_SURFACE calls while this GEM handle was still open, this
++ * bridge's eventual .free() would unref a handle number that may by then
++ * have been recycled for a completely unrelated object.
++ */
++struct vmw_prime_import_bridge {
++	struct drm_gem_object    base;
++	struct ttm_base_object  *base_obj;
++	uint32_t                 ttm_handle;
++};
++
++static void vmw_prime_import_bridge_free(struct drm_gem_object *obj)
++{
++	struct vmw_prime_import_bridge *bridge =
++		container_of(obj, struct vmw_prime_import_bridge, base);
++
++	ttm_base_object_unref(&bridge->base_obj);
++	drm_gem_object_release(obj);
++	kfree(bridge);
++}
++
++static const struct drm_gem_object_funcs vmw_prime_import_bridge_funcs = {
++	.free = vmw_prime_import_bridge_free,
++};
++
++/**
++ * vmw_prime_resolve_handle - Translate a possible prime-import bridge GEM
++ * handle back to the real ttm handle it wraps, and pin it there.
++ *
++ * @file_priv: The caller's drm file, whose own GEM handle table is checked.
++ * @handle: A handle as supplied by userspace -- either an ordinary raw ttm
++ * handle (the common case, unchanged from historical behavior), or a
++ * bridge handle returned by vmw_prime_fd_to_handle() above.
++ * @real_handle: Set to the real ttm handle to use. If @handle does not name
++ * one of this file's own prime-import bridge objects, set to @handle
++ * unchanged.
++ *
++ * Returns a reference to the bridge's GEM object if @handle named one, which
++ * the caller must release with drm_gem_object_put() -- but not until it is
++ * completely done using *@real_handle, not merely until *@real_handle has
++ * been read. Returns NULL if @handle did not name a bridge object; nothing
++ * to release in that case.
++ *
++ * This reference must stay held for as long as *@real_handle is still going
++ * to be used, not just across this call. The bridge's own reference on the
++ * underlying ttm_base_object (see vmw_prime_fd_to_handle() above) is only
++ * dropped once every reference on the bridge's GEM object -- including this
++ * one -- goes away. Returning a bare integer and letting the bridge's
++ * reference be dropped immediately here would leave a window between
++ * resolving the handle and the caller actually using it in which a
++ * concurrent GEM_CLOSE on the same bridge from another thread could be the
++ * last reference, freeing the real object and letting its slot in the
++ * global ttm handle space (tdev->idr, shared by every client of the device)
++ * be recycled for a completely unrelated object -- of another process's,
++ * even -- before the caller's now-stale *@real_handle is used. For a
++ * tfile-scoped consumer (ttm_ref_object_base_unref()) that only means a
++ * clean -EINVAL; for a global lookup like
++ * ttm_base_object_lookup_for_ref(dev_priv->tdev, ...)
++ * (vmw_surface_handle_reference()'s legacy branch) it means the caller can
++ * end up adding its own valid reference to a surface that belongs to a
++ * different process entirely.
++ */
++struct drm_gem_object *
++vmw_prime_resolve_handle(struct drm_file *file_priv, uint32_t handle,
++			 uint32_t *real_handle)
++{
++	struct drm_gem_object *gobj = drm_gem_object_lookup(file_priv, handle);
++
++	*real_handle = handle;
++
++	if (!gobj)
++		return NULL;
++
++	if (gobj->funcs != &vmw_prime_import_bridge_funcs) {
++		drm_gem_object_put(gobj);
++		return NULL;
++	}
++
++	*real_handle = container_of(gobj, struct vmw_prime_import_bridge, base)->ttm_handle;
++
++	return gobj;
++}
++
+ int vmw_prime_fd_to_handle(struct drm_device *dev,
+ 			   struct drm_file *file_priv,
+ 			   int fd, u32 *handle)
+ {
++	struct vmw_private *dev_priv = vmw_priv(dev);
+ 	struct ttm_object_file *tfile = vmw_fpriv(file_priv)->tfile;
+-	int ret = ttm_prime_fd_to_handle(tfile, fd, handle);
++	struct vmw_prime_import_bridge *bridge;
++	struct ttm_base_object *base_obj;
++	uint32_t ttm_handle;
++	int ret = ttm_prime_fd_to_handle(tfile, fd, &ttm_handle);
+ 
+ 	if (ret)
+-		ret = drm_gem_prime_fd_to_handle(dev, file_priv, fd, handle);
++		return drm_gem_prime_fd_to_handle(dev, file_priv, fd, handle);
++
++	/*
++	 * Take our own independent reference before dropping the transient
++	 * one ttm_prime_fd_to_handle() just created, so the object can never
++	 * be dropped to zero in between.
++	 */
++	base_obj = ttm_base_object_lookup_for_ref(dev_priv->tdev, ttm_handle);
++	if (!base_obj) {
++		ttm_ref_object_base_unref(tfile, ttm_handle);
++		return -EINVAL;
++	}
++
++	bridge = kzalloc(sizeof(*bridge), GFP_KERNEL);
++	if (!bridge) {
++		ttm_base_object_unref(&base_obj);
++		ttm_ref_object_base_unref(tfile, ttm_handle);
++		return -ENOMEM;
++	}
++
++	drm_gem_private_object_init(dev, &bridge->base, PAGE_SIZE);
++	bridge->base.funcs = &vmw_prime_import_bridge_funcs;
++	bridge->base_obj   = base_obj;
++	bridge->ttm_handle = ttm_handle;
++
++	ret = drm_gem_handle_create(file_priv, &bridge->base, handle);
++	drm_gem_object_put(&bridge->base);
++
++	/*
++	 * On success, deliberately leave the transient ttm_ref_object entry
++	 * ttm_prime_fd_to_handle() created in place -- do not touch it.
++	 * vmw_surface_handle_reference()'s DRM_VMW_REF_SURFACE path forces
++	 * require_exist=true for render clients (drm_is_render_client()),
++	 * which is exactly what Mesa and this bridge's own callers are, and
++	 * ttm_ref_object_add() with require_existed=true returns -EPERM
++	 * unless a ref-object entry for this (tfile, ttm_handle) pair
++	 * already exists -- it will not create a new one. This entry is
++	 * that pre-existing one. Stock vmw_prime_fd_to_handle() never
++	 * touched it either, for the same reason. Our own independent
++	 * base_obj reference above is what makes GEM_CLOSE work; it does
++	 * not replace this entry, it exists alongside it.
++	 *
++	 * On failure, nothing else will ever be able to reach this handle to
++	 * release it, so clean it up here to avoid leaking it.
++	 */
++	if (ret)
++		ttm_ref_object_base_unref(tfile, ttm_handle);
+ 
+ 	return ret;
+ }
+@@ -92,16 +264,31 @@ int vmw_prime_handle_to_fd(struct drm_device *dev,
+ {
+ 	struct vmw_private *vmw = vmw_priv(dev);
+ 	struct ttm_object_file *tfile = vmw_fpriv(file_priv)->tfile;
++	struct drm_gem_object *bridge_obj;
+ 	struct vmw_bo *vbo;
+ 	int ret;
+ 	int surf_handle;
+ 
++	/*
++	 * A bridge handle (vmw_prime_fd_to_handle() above) always resolves
++	 * to a real ttm handle above VMWGFX_NUM_MOB (surface handles are
++	 * allocated starting there -- see ttm_object_device_init()), so
++	 * resolving it here correctly routes a re-exported bridge handle
++	 * into the ttm_prime_handle_to_fd() branch below instead of
++	 * vmw_user_bo_lookup(), which would otherwise reject it outright
++	 * (see the type-check added there) rather than doing anything
++	 * useful with it. Held across both branches for the same reason
++	 * vmw_prime_resolve_handle()'s other callers hold it: closing the
++	 * race window between resolving the handle and actually using it.
++	 */
++	bridge_obj = vmw_prime_resolve_handle(file_priv, handle, &handle);
++
+ 	if (handle > VMWGFX_NUM_MOB) {
+ 		ret = ttm_prime_handle_to_fd(tfile, handle, flags, prime_fd);
+ 	} else {
+ 		ret = vmw_user_bo_lookup(file_priv, handle, &vbo);
+ 		if (ret)
+-			return ret;
++			goto out;
+ 		if (vbo && vbo->is_dumb) {
+ 			ret = drm_gem_prime_handle_to_fd(dev, file_priv, handle,
+ 							 flags, prime_fd);
+@@ -120,5 +307,9 @@ int vmw_prime_handle_to_fd(struct drm_device *dev,
+ 		vmw_user_bo_unref(&vbo);
+ 	}
+ 
++out:
++	if (bridge_obj)
++		drm_gem_object_put(bridge_obj);
++
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+index e3a187a..fcbab66 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+@@ -245,6 +245,9 @@ int vmw_resource_init(struct vmw_private *dev_priv, struct vmw_resource *res,
+  * TTM user-space handle and perform basic type checks
+  *
+  * @dev_priv:     Pointer to a device private struct
++ * @file_priv:    Pointer to the caller's drm file, used to resolve a
++ *                possible prime-import bridge handle back to its real
++ *                TTM handle before use
+  * @tfile:        Pointer to a struct ttm_object_file identifying the caller
+  * @handle:       The TTM user-space handle
+  * @converter:    Pointer to an object describing the resource type
+@@ -255,17 +258,31 @@ int vmw_resource_init(struct vmw_private *dev_priv, struct vmw_resource *res,
+  * type, -EINVAL will be returned.
+  */
+ int vmw_user_resource_lookup_handle(struct vmw_private *dev_priv,
++				    struct drm_file *file_priv,
+ 				    struct ttm_object_file *tfile,
+ 				    uint32_t handle,
+ 				    const struct vmw_user_resource_conv
+ 				    *converter,
+ 				    struct vmw_resource **p_res)
+ {
++	struct drm_gem_object *bridge_obj;
+ 	struct ttm_base_object *base;
+ 	struct vmw_resource *res;
+ 	int ret = -EINVAL;
+ 
++	/*
++	 * Keep a bridge (if any) pinned across the lookup below, not just
++	 * while resolving handle -- see vmw_prime_resolve_handle() for why.
++	 * ttm_base_object_lookup() is scoped to this tfile rather than the
++	 * global ttm handle space, which makes this specific call site lower
++	 * risk than vmw_surface_handle_reference()'s global lookup, but
++	 * pinning here too costs nothing and avoids relying on that being
++	 * true forever.
++	 */
++	bridge_obj = vmw_prime_resolve_handle(file_priv, handle, &handle);
+ 	base = ttm_base_object_lookup(tfile, handle);
++	if (bridge_obj)
++		drm_gem_object_put(bridge_obj);
+ 	if (unlikely(!base))
+ 		return -EINVAL;
+ 
+@@ -300,7 +317,7 @@ int vmw_user_object_lookup(struct vmw_private *dev_priv,
+ 
+ 	WARN_ON(uo->surface || uo->buffer);
+ 
+-	ret = vmw_user_resource_lookup_handle(dev_priv, tfile, handle,
++	ret = vmw_user_resource_lookup_handle(dev_priv, filp, tfile, handle,
+ 					      user_surface_converter,
+ 					      &res);
+ 	if (!ret) {
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+index bd05637..d29b298 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+@@ -689,8 +689,22 @@ int vmw_surface_destroy_ioctl(struct drm_device *dev, void *data,
+ {
+ 	struct drm_vmw_surface_arg *arg = (struct drm_vmw_surface_arg *)data;
+ 	struct ttm_object_file *tfile = vmw_fpriv(file_priv)->tfile;
++	struct drm_gem_object *bridge_obj;
++	uint32_t sid;
++	int ret;
+ 
+-	return ttm_ref_object_base_unref(tfile, arg->sid);
++	/*
++	 * Keep the bridge (if arg->sid names one) pinned for the whole unref
++	 * below, not just while resolving sid -- see vmw_prime_resolve_handle()
++	 * for why a race window here is a real cross-process hijack risk, not
++	 * just a theoretical one.
++	 */
++	bridge_obj = vmw_prime_resolve_handle(file_priv, arg->sid, &sid);
++	ret = ttm_ref_object_base_unref(tfile, sid);
++	if (bridge_obj)
++		drm_gem_object_put(bridge_obj);
++
++	return ret;
+ }
+ 
+ /**
+@@ -986,6 +1000,7 @@ vmw_surface_handle_reference(struct vmw_private *dev_priv,
+ {
+ 	struct ttm_object_file *tfile = vmw_fpriv(file_priv)->tfile;
+ 	struct vmw_user_surface *user_srf = NULL;
++	struct drm_gem_object *bridge_obj = NULL;
+ 	uint32_t handle;
+ 	struct ttm_base_object *base;
+ 	int ret;
+@@ -999,11 +1014,25 @@ vmw_surface_handle_reference(struct vmw_private *dev_priv,
+ 								&handle,
+ 								base_p);
+ 	} else {
+-		handle = u_handle;
++		/*
++		 * u_handle may be a raw ttm handle (the historical case), or
++		 * a prime-import bridge GEM handle returned by an earlier
++		 * generic PRIME_FD_TO_HANDLE call (see vmwgfx_prime.c) --
++		 * resolve it back to the real ttm handle either way. Keep the
++		 * bridge pinned across the lookup immediately below -- see
++		 * vmw_prime_resolve_handle()'s comment for why a race window
++		 * here on this *global* lookup is a real cross-process
++		 * surface-hijack risk, not just a theoretical one.
++		 */
++		bridge_obj = vmw_prime_resolve_handle(file_priv, u_handle, &handle);
+ 	}
+ 
+ 	ret = -EINVAL;
+ 	base = ttm_base_object_lookup_for_ref(dev_priv->tdev, handle);
++	if (bridge_obj) {
++		drm_gem_object_put(bridge_obj);
++		bridge_obj = NULL;
++	}
+ 	if (unlikely(!base)) {
+ 		VMW_DEBUG_USER("Could not find surface to reference.\n");
+ 		goto out_no_lookup;
+@@ -2321,7 +2350,7 @@ int vmw_dumb_create(struct drm_file *file_priv,
+ 	args->size = arg.rep.buffer_size;
+ 	args->pitch = vmw_surface_calculate_pitch(desc, &drm_size);
+ 
+-	ret = vmw_user_resource_lookup_handle(dev_priv, tfile, arg.rep.handle,
++	ret = vmw_user_resource_lookup_handle(dev_priv, file_priv, tfile, arg.rep.handle,
+ 					      user_surface_converter,
+ 					      &res);
+ 	if (ret) {
